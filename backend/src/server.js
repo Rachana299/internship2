@@ -4,6 +4,7 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import mongoose from 'mongoose';
 import multer from 'multer';
+import PDFDocument from 'pdfkit';
 import path from 'node:path';
 import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
@@ -15,7 +16,8 @@ const port=Number(process.env.PORT||5000);
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
 const uploadDir=path.join(__dirname,'..','uploads');
 fs.mkdirSync(uploadDir,{recursive:true});
-const upload=multer({dest:uploadDir});
+const storage=multer.diskStorage({destination:(req,file,cb)=>cb(null,uploadDir),filename:(req,file,cb)=>cb(null,Date.now()+'-'+Math.round(Math.random()*1e9)+path.extname(file.originalname))});
+const upload=multer({storage});
 
 app.use(cors({origin:process.env.CLIENT_URL||'http://localhost:5173'}));
 app.use(express.json());
@@ -27,11 +29,11 @@ const populateAppointment=query=>query.populate({path:'patient',populate:{path:'
 app.get('/api/health',(req,res)=>res.json({ok:true}));
 
 app.post('/api/auth/register',async(req,res)=>{
-  const {name,email,password}=req.body;
+  const {name,email,password,phone,address,bloodGroup,age}=req.body;
   if(!name||!email||!password)return res.status(400).json({message:'Name, email and password are required'});
   if(await User.findOne({email}))return res.status(409).json({message:'Email already registered'});
-  const user=await User.create({name,email,password:await bcrypt.hash(password,10),role:'patient'});
-  await Patient.create({user:user._id});
+  const user=await User.create({name,email,password:await bcrypt.hash(password,10),role:'patient',phone,address});
+  await Patient.create({user:user._id,bloodGroup,age});
   res.status(201).json({token:sign(user)});
 });
 app.post('/api/auth/login',async(req,res)=>{
@@ -43,9 +45,49 @@ app.get('/api/auth/me',auth,(req,res)=>res.json(publicUser(req.user)));
 
 app.get('/api/departments',auth,async(req,res)=>res.json(await Department.find().sort({name:1})));
 app.get('/api/doctors',auth,async(req,res)=>res.json(await Doctor.find().populate('user','name email phone').populate('department')));
+app.patch('/api/doctors/:id/availability',auth,allow('doctor','admin'),async(req,res)=>{
+  const {availableDays,availableFrom,availableTo}=req.body;
+  const update={};
+  if(availableDays)update.availableDays=availableDays;
+  if(availableFrom)update.availableFrom=availableFrom;
+  if(availableTo)update.availableTo=availableTo;
+  const doctor=await Doctor.findByIdAndUpdate(req.params.id,update,{new:true});
+  if(!doctor)return res.status(404).json({message:'Doctor not found'});
+  res.json(doctor);
+});
+app.get('/api/doctors/:id/slots',auth,async(req,res)=>{
+  const doctor=await Doctor.findById(req.params.id);
+  if(!doctor)return res.status(404).json({message:'Doctor not found'});
+  const date=req.query.date;
+  if(!date)return res.status(400).json({message:'Date is required'});
+  const [y,m,d]=date.split('-').map(Number);
+  const weekday=new Date(y,m-1,d).toLocaleDateString('en-US',{weekday:'long'});
+  if(doctor.availableDays?.length&&!doctor.availableDays.includes(weekday))return res.json([]);
+  const [fh,fm]=(doctor.availableFrom||'09:00').split(':').map(Number);
+  const [th,tm]=(doctor.availableTo||'17:00').split(':').map(Number);
+  const slots=[];
+  for(let mins=fh*60+fm;mins+30<=th*60+tm;mins+=30)slots.push(`${String(Math.floor(mins/60)).padStart(2,'0')}:${String(mins%60).padStart(2,'0')}`);
+  const dayStart=new Date(y,m-1,d,0,0,0),dayEnd=new Date(y,m-1,d,23,59,59);
+  const booked=await Appointment.find({doctor:doctor._id,date:{$gte:dayStart,$lte:dayEnd},status:{$ne:'cancelled'}});
+  const bookedTimes=new Set(booked.map(a=>`${String(a.date.getHours()).padStart(2,'0')}:${String(a.date.getMinutes()).padStart(2,'0')}`));
+  res.json(slots.filter(s=>!bookedTimes.has(s)));
+});
 app.get('/api/patients',auth,allow('admin','doctor'),async(req,res)=>{
   const users=await User.find({role:'patient',...(req.query.q?{name:new RegExp(req.query.q,'i')}: {})}).select('_id');
   res.json(await Patient.find({user:{$in:users.map(user=>user._id)}}).populate('user','name email phone'));
+});
+app.get('/api/patients/:id',auth,allow('admin','doctor'),async(req,res)=>{
+  const patient=await Patient.findById(req.params.id).populate('user','name email phone address');
+  if(!patient)return res.status(404).json({message:'Patient not found'});
+  const reports=await Report.find({patient:patient._id}).sort({createdAt:-1});
+  res.json({...patient.toObject(),reports});
+});
+app.delete('/api/patients/:id',auth,allow('admin','doctor'),async(req,res)=>{
+  const patient=await Patient.findById(req.params.id);
+  if(!patient)return res.status(404).json({message:'Patient not found'});
+  await User.findByIdAndDelete(patient.user);
+  await patient.deleteOne();
+  res.json({ok:true});
 });
 
 app.get('/api/appointments',auth,async(req,res)=>{
@@ -62,14 +104,66 @@ app.post('/api/appointments',auth,allow('patient'),async(req,res)=>{
   if(await Appointment.findOne({doctor,date:new Date(date),status:{$nin:['cancelled','completed']}}))return res.status(409).json({message:'Doctor is already booked at this time'});
   res.status(201).json(await Appointment.create({patient:patient._id,doctor,department:selected.department,date,reason}));
 });
-app.patch('/api/appointments/:id',auth,allow('doctor','admin'),async(req,res)=>res.json(await Appointment.findByIdAndUpdate(req.params.id,{status:req.body.status},{new:true})));
+app.patch('/api/appointments/:id',auth,allow('doctor','admin'),async(req,res)=>{const update={};if(req.body.status)update.status=req.body.status;if(req.body.paymentStatus)update.paymentStatus=req.body.paymentStatus;res.json(await Appointment.findByIdAndUpdate(req.params.id,update,{new:true}))});
 
 app.get('/api/reports',auth,async(req,res)=>{const patient=await Patient.findOne({user:req.user._id});res.json(await Report.find({patient:patient?._id}).sort({createdAt:-1}));});
 app.post('/api/reports',auth,allow('patient'),upload.single('report'),async(req,res)=>{const patient=await Patient.findOne({user:req.user._id});if(!req.file||!patient)return res.status(400).json({message:'Report file is required'});res.status(201).json(await Report.create({patient:patient._id,originalName:req.file.originalname,fileName:req.file.filename,mimeType:req.file.mimetype,path:`/uploads/${req.file.filename}`}));});
 
 app.get('/api/prescriptions',auth,async(req,res)=>{let filter={};if(req.user.role==='patient'){const patient=await Patient.findOne({user:req.user._id});filter.patient=patient?._id;}if(req.user.role==='doctor'){const doctor=await Doctor.findOne({user:req.user._id});filter.doctor=doctor?._id;}res.json(await Prescription.find(filter).populate({path:'patient',populate:{path:'user',select:'name'}}).populate({path:'doctor',populate:{path:'user',select:'name'}}).populate('appointment'));});
-app.post('/api/prescriptions',auth,allow('doctor'),async(req,res)=>{const doctor=await Doctor.findOne({user:req.user._id});const appointment=await Appointment.findById(req.body.appointment);if(!doctor||!appointment)return res.status(400).json({message:'Invalid appointment'});res.status(201).json(await Prescription.create({...req.body,doctor:doctor._id,patient:appointment.patient}));});
+app.post('/api/prescriptions',auth,allow('doctor'),async(req,res)=>{
+  const doctor=await Doctor.findOne({user:req.user._id});
+  const appointment=await Appointment.findById(req.body.appointment);
+  if(!doctor||!appointment)return res.status(400).json({message:'Invalid appointment'});
+  const prescription=await Prescription.create({...req.body,doctor:doctor._id,patient:appointment.patient});
+  const patient=await Patient.findById(appointment.patient).populate('user','name');
+  const fileName=`prescription-${prescription._id}.pdf`;
+  const filePath=path.join(uploadDir,fileName);
+  const doc=new PDFDocument({margin:50});
+  const stream=fs.createWriteStream(filePath);
+  doc.pipe(stream);
+  doc.fontSize(20).text('MediCare - Prescription',{align:'center'});
+  doc.moveDown();
+  doc.fontSize(12).text(`Date: ${new Date().toLocaleDateString()}`);
+  doc.text(`Patient: ${patient?.user?.name||'-'}`);
+  doc.text(`Doctor: Dr. ${req.user.name}`);
+  doc.moveDown();
+  doc.fontSize(14).text('Diagnosis',{underline:true});
+  doc.fontSize(12).text(prescription.diagnosis||'-');
+  doc.moveDown();
+  doc.fontSize(14).text('Medicines',{underline:true});
+  (prescription.medicines||[]).forEach(m=>doc.fontSize(12).text(`${m.name||'-'} — ${m.dosage||'-'} — ${m.duration||'-'}`));
+  doc.moveDown();
+  doc.fontSize(14).text('Instructions',{underline:true});
+  doc.fontSize(12).text(prescription.instructions||'-');
+  if(prescription.followUpDate){doc.moveDown();doc.text(`Follow-up date: ${new Date(prescription.followUpDate).toLocaleDateString()}`);}
+  doc.end();
+  await new Promise(resolve=>stream.on('finish',resolve));
+  prescription.pdfPath=`/uploads/${fileName}`;
+  await prescription.save();
+  res.status(201).json(prescription);
+});
 app.post('/api/admin/doctors',auth,allow('admin'),async(req,res)=>{const {name,email,password,specialization,department}=req.body;if(await User.findOne({email}))return res.status(409).json({message:'Email already registered'});const user=await User.create({name,email,password:await bcrypt.hash(password||'Doctor@123',10),role:'doctor'});res.status(201).json(await Doctor.create({user:user._id,specialization,department}));});
+app.delete('/api/admin/doctors/:id',auth,allow('admin'),async(req,res)=>{
+  const doctor=await Doctor.findById(req.params.id);
+  if(!doctor)return res.status(404).json({message:'Doctor not found'});
+  await User.findByIdAndDelete(doctor.user);
+  await doctor.deleteOne();
+  res.json({ok:true});
+});
+app.patch('/api/admin/doctors/:id/password',auth,allow('admin'),async(req,res)=>{
+  const doctor=await Doctor.findById(req.params.id);
+  if(!doctor)return res.status(404).json({message:'Doctor not found'});
+  if(!req.body.password)return res.status(400).json({message:'Password is required'});
+  await User.findByIdAndUpdate(doctor.user,{password:await bcrypt.hash(req.body.password,10)});
+  res.json({ok:true});
+});
+app.patch('/api/admin/patients/:id/password',auth,allow('admin'),async(req,res)=>{
+  const patient=await Patient.findById(req.params.id);
+  if(!patient)return res.status(404).json({message:'Patient not found'});
+  if(!req.body.password)return res.status(400).json({message:'Password is required'});
+  await User.findByIdAndUpdate(patient.user,{password:await bcrypt.hash(req.body.password,10)});
+  res.json({ok:true});
+});
 app.post('/api/admin/departments',auth,allow('admin'),async(req,res)=>res.status(201).json(await Department.create({name:req.body.name})));
 app.get('/api/admin/stats',auth,allow('admin'),async(req,res)=>{const today=new Date();today.setHours(0,0,0,0);const [patients,doctors,departments,appointments,completed,revenue,statuses]=await Promise.all([Patient.countDocuments(),Doctor.countDocuments(),Department.countDocuments(),Appointment.countDocuments({date:{$gte:today}}),Appointment.countDocuments({status:'completed'}),Appointment.countDocuments({paymentStatus:'Paid'}),Appointment.aggregate([{$group:{_id:'$status',count:{$sum:1}}}])]);res.json({patients,doctors,departments,appointments,completed,revenue:revenue*500,statuses});});
 
